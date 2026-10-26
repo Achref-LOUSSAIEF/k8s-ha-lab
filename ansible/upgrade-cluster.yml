@@ -1,0 +1,113 @@
+---
+# Phase 9: rolling minor upgrade, one node at a time (first master, other masters, workers).
+#
+#   ansible-playbook upgrade-cluster.yml -e k8s_version=v1.37
+#
+# Installs the latest patch of that minor. Re-runnable: nodes already upgraded are skipped.
+# Afterwards, set k8s_version=v1.37 in inventory.ini so new nodes get the same version.
+
+- name: Upgrade Kubernetes node by node
+  hosts: k8s
+  become: true
+  serial: 1
+  order: inventory          # cp1, cp2, cp3, w1, w2
+  vars:
+    first_cp: "{{ groups['control_plane'][0] }}"
+    is_first_cp: "{{ inventory_hostname == first_cp }}"
+    is_cp: "{{ inventory_hostname in groups['control_plane'] }}"
+
+  tasks:
+    # ---------- New package repo (pkgs.k8s.io has one repo per minor) ----------
+    - name: Refresh the Kubernetes repo signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+        force: true
+
+    - name: Point apt at the new minor version
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /\n"
+        mode: "0644"
+
+    # ---------- 1. kubeadm first ----------
+    - name: Upgrade kubeadm (held package)
+      ansible.builtin.apt:
+        name: kubeadm
+        state: latest
+        update_cache: true
+        allow_change_held_packages: true
+
+    - name: Read the target version from the new kubeadm
+      ansible.builtin.command: kubeadm version -o short
+      register: target
+      changed_when: false
+
+    - name: Read the current kubelet version
+      ansible.builtin.command: kubelet --version
+      register: current
+      changed_when: false
+
+    - name: Upgrade this node
+      when: target.stdout not in current.stdout
+      block:
+        # ---------- 2. Control plane components ----------
+        - name: Show the upgrade plan (first master only)
+          ansible.builtin.command: kubeadm upgrade plan
+          register: plan
+          changed_when: false
+          when: is_first_cp | bool
+
+        - name: Print the plan
+          ansible.builtin.debug:
+            var: plan.stdout_lines
+          when: is_first_cp | bool
+
+        - name: Upgrade the cluster (first master: control plane, etcd, CoreDNS, cluster config)
+          ansible.builtin.command: "kubeadm upgrade apply {{ target.stdout }} --yes"
+          when: is_first_cp | bool
+
+        - name: Upgrade this node's components and config (other masters and workers)
+          ansible.builtin.command: kubeadm upgrade node
+          when: not (is_first_cp | bool)
+
+        # ---------- 3. Drain, kubelet, uncordon ----------
+        - name: Drain the node (respects PodDisruptionBudgets)
+          ansible.builtin.command: >
+            kubectl drain {{ inventory_hostname }}
+            --ignore-daemonsets --delete-emptydir-data --timeout=5m
+          delegate_to: "{{ first_cp }}"
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+        - name: Upgrade kubelet and kubectl
+          ansible.builtin.apt:
+            name: [kubelet, kubectl]
+            state: latest
+            allow_change_held_packages: true
+
+        - name: Restart kubelet
+          ansible.builtin.systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: true
+
+        - name: Wait until the node is Ready again
+          ansible.builtin.command: "kubectl wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=5m"
+          delegate_to: "{{ first_cp }}"
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+          changed_when: false
+
+        - name: Uncordon the node
+          ansible.builtin.command: "kubectl uncordon {{ inventory_hostname }}"
+          delegate_to: "{{ first_cp }}"
+          environment:
+            KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Hold the packages at their new version
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubeadm, kubelet, kubectl]

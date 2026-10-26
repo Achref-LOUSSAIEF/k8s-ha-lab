@@ -57,6 +57,8 @@ ansible/
   prepare-nodes.yml              node prerequisites (phase 2)
   bootstrap-cluster.yml          kube-vip, kubeadm init, joins (phases 3, 4, 6)
   install-cilium.yml             Cilium (phase 5)
+  etcd-restore.yml               disaster recovery: restore etcd on the 3 masters
+  upgrade-cluster.yml            rolling minor upgrade, node by node
   templates/kubeadm-init.yaml.j2 kubeadm InitConfiguration + ClusterConfiguration
   tasks/user-kubeconfig.yml
 ```
@@ -77,6 +79,37 @@ powered off abruptly with `virsh destroy` (equivalent to pulling the plug).
 The ~20 s are the time for the kube-vip lease to expire, for a surviving master to win
 the election and announce the VIP with a gratuitous ARP, and for etcd to elect a new leader.
 The test loop has a 2 s timeout plus a 1 s pause, so the measure is accurate to ~3 s.
+
+## etcd drills
+
+**Snapshot.** `etcdctl snapshot save` on a master, integrity checked with
+`etcdutl snapshot status`, then copied off the cluster to `backups/` (git-ignored: an etcd
+snapshot holds every Secret in plain text).
+
+**Replacing a dead master.** `cp3` was destroyed, then:
+1. quorum checked from `cp1`: 2/3 members healthy, the cluster keeps working;
+2. dead member removed with `etcdctl member remove` (otherwise a new `cp3` can't join:
+   etcd refuses a member whose name/peer URL already exists);
+3. `kubectl delete node cp3`, then the VM was rebuilt from scratch with `vagrant up` +
+   `prepare-nodes.yml` + `bootstrap-cluster.yml`;
+4. `cp3` back in the quorum with a **new member ID** (`31197a5d…` → `af873236…`).
+
+**Full restore** (`ansible/etcd-restore.yml`). Unlike a single-node restore, a 3-member
+stacked etcd needs every member restored together:
+1. stop all etcd and kube-apiserver static pods on the 3 masters;
+2. move each data dir aside (kept, never deleted during a DR);
+3. `etcdutl snapshot restore` on each master with its own `--name` and peer URL and a
+   shared `--initial-cluster`: this creates a new 3-member cluster from the snapshot data;
+4. start everything again, restart controller-manager, scheduler and kubelets.
+
+Test: a namespace present in the snapshot was deleted, and another one created after the
+snapshot. After the restore, the first one is back with its Deployment, and the second one
+is gone. Anything written after the last snapshot is lost: the backup frequency is the RPO.
+
+Lesson learned: the first run of the restore runbook stopped halfway, with the API down on
+all masters, because it relied on `crictl`, which isn't installed on the nodes. It now
+watches processes with `pgrep`, and it is idempotent, so re-running it resumed the restore
+where it stopped. Test DR runbooks before you need them.
 
 ## Problems met and how they were solved
 
@@ -110,6 +143,6 @@ The test loop has a 2 s timeout plus a 1 s pause, so the measure is accurate to 
 - [x] HA control plane: 3 masters, stacked etcd, kube-vip VIP
 - [x] Cilium with kube-proxy replacement
 - [x] HA test: loss of the VIP holder
-- [ ] etcd: snapshot, restore, replacement of a quorum member
+- [x] etcd: snapshot, restore, replacement of a quorum member
 - [ ] Minor version upgrade (1.36 → 1.37), node by node, without workload downtime
 - [ ] NetworkPolicies: default-deny per namespace, explicit allows, observed with Hubble

@@ -3,3 +3,4 @@
 # Cluster admin credentials: never commit
 kubeconfig
 *.retry
+backups/

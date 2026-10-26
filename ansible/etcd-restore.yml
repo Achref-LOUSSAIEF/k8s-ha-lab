@@ -1,0 +1,131 @@
+---
+# Disaster recovery: restore the whole etcd cluster from a snapshot.
+# DESTRUCTIVE: everything written after the snapshot is lost.
+#
+#   ansible-playbook etcd-restore.yml -e snapshot_file=etcd-snap-XXXX.db -e confirm=yes
+#
+# The snapshot is read from ../backups/. Steps run in lockstep on the 3 control
+# planes: all API servers and etcd stop, each member is restored with its own
+# identity into a fresh data dir, then everything starts again together.
+
+- name: Restore etcd on every control plane
+  hosts: control_plane
+  become: true
+  vars:
+    etcd_version: v3.6.8
+    snapshot_local: "{{ playbook_dir }}/../backups/{{ snapshot_file }}"
+    initial_cluster: >-
+      {% for h in groups['control_plane'] -%}
+      {{ h }}=https://{{ hostvars[h].node_ip }}:2380{{ '' if loop.last else ',' }}
+      {%- endfor %}
+
+  pre_tasks:
+    - name: Refuse to run without explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm | default('no') == 'yes'
+          - snapshot_file is defined
+        fail_msg: "Destructive. Run with -e snapshot_file=<file in backups/> -e confirm=yes"
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    # ---------- Preparation (nothing is stopped yet) ----------
+    - name: Install etcdutl if missing
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL https://github.com/etcd-io/etcd/releases/download/{{ etcd_version }}/etcd-{{ etcd_version }}-linux-amd64.tar.gz \
+          | tar xz -C /usr/local/bin --strip-components=1 \
+            etcd-{{ etcd_version }}-linux-amd64/etcdctl etcd-{{ etcd_version }}-linux-amd64/etcdutl
+      args:
+        executable: /bin/bash
+        creates: /usr/local/bin/etcdutl
+
+    - name: Copy the snapshot to the node
+      ansible.builtin.copy:
+        src: "{{ snapshot_local }}"
+        dest: /root/etcd-restore.db
+        mode: "0600"
+
+    - name: Check the snapshot integrity before touching anything
+      ansible.builtin.command: etcdutl snapshot status /root/etcd-restore.db -w table
+      register: snap_status
+      changed_when: false
+
+    - name: Show snapshot info
+      ansible.builtin.debug:
+        var: snap_status.stdout_lines
+      run_once: true
+
+    # ---------- Stop etcd and the API servers on all masters ----------
+    - name: Create a folder for the stopped manifests
+      ansible.builtin.file:
+        path: /root/manifests-stopped
+        state: directory
+        mode: "0700"
+
+    - name: Stop etcd and kube-apiserver (move their static pod manifests out)
+      ansible.builtin.command: "mv /etc/kubernetes/manifests/{{ item }}.yaml /root/manifests-stopped/"
+      args:
+        creates: "/root/manifests-stopped/{{ item }}.yaml"
+      loop: [kube-apiserver, etcd]
+
+    # crictl isn't installed on these nodes, so we watch the processes directly.
+    # pgrep returns 1 when no process matches.
+    - name: Wait until the etcd and kube-apiserver processes are gone
+      ansible.builtin.command: pgrep -x 'etcd|kube-apiserver'
+      register: running
+      until: running.rc == 1
+      retries: 30
+      delay: 2
+      failed_when: running.rc not in [0, 1]
+      changed_when: false
+
+    # ---------- Restore ----------
+    - name: Keep the old data dir aside (never delete it during a DR)
+      ansible.builtin.command: "mv /var/lib/etcd /var/lib/etcd.before-restore-{{ ansible_date_time.epoch }}"
+      args:
+        removes: /var/lib/etcd
+
+    # Each member gets its own name and peer URL; all of them get the same
+    # --initial-cluster, which creates a NEW 3-member cluster from the snapshot data.
+    - name: Restore the snapshot into a fresh data dir
+      ansible.builtin.command: >
+        etcdutl snapshot restore /root/etcd-restore.db
+        --name {{ inventory_hostname }}
+        --initial-cluster {{ initial_cluster }}
+        --initial-advertise-peer-urls https://{{ node_ip }}:2380
+        --data-dir /var/lib/etcd
+
+    # ---------- Start everything again ----------
+    - name: Start etcd and kube-apiserver again
+      ansible.builtin.command: "mv /root/manifests-stopped/{{ item }}.yaml /etc/kubernetes/manifests/"
+      args:
+        creates: "/etc/kubernetes/manifests/{{ item }}.yaml"
+      loop: [etcd, kube-apiserver]
+
+    - name: Wait for the API on the VIP
+      ansible.builtin.wait_for:
+        host: "{{ api_vip }}"
+        port: 6443
+        timeout: 300
+      run_once: true
+
+    # Recommended by the Kubernetes docs: restart the components that cached
+    # the old cluster state, so they re-read everything from the restored etcd.
+    # Killing the process is enough: kubelet restarts the static pod's container.
+    - name: Restart kube-controller-manager and kube-scheduler
+      ansible.builtin.command: pkill -f '^kube-controller-manager|^kube-scheduler'
+      register: killed
+      failed_when: killed.rc not in [0, 1]
+      changed_when: killed.rc == 0
+
+- name: Restart kubelet on every node
+  hosts: k8s
+  become: true
+  tasks:
+    - name: Restart kubelet
+      ansible.builtin.service:
+        name: kubelet
+        state: restarted
