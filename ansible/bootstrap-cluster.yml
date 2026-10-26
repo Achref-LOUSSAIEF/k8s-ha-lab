@@ -110,9 +110,15 @@
       changed_when: false
       failed_when: cert_key.stdout | length != 64
 
+    # With the default /etc/kubernetes/admin.conf, kubeadm rewrites the API address
+    # to the node's default-route IP (the Vagrant NAT IP), which isn't in the API
+    # server certificate: every call fails TLS and retries until timeout.
+    # Any other kubeconfig path is used as-is, so we use the vagrant user's copy,
+    # which goes through the VIP.
     - name: Upload the control plane certs, encrypted with that key (expires after 2h)
       ansible.builtin.command: >
         kubeadm init phase upload-certs --upload-certs
+        --kubeconfig /home/vagrant/.kube/config
         --certificate-key {{ cert_key.stdout }}
       changed_when: true
 
