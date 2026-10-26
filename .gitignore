@@ -1,0 +1,5 @@
+# Vagrant state, including each VM's private SSH key
+.vagrant/
+# Cluster admin credentials: never commit
+kubeconfig
+*.retry

@@ -1,0 +1,27 @@
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ node_ip }}"   # private network IP, not the Vagrant NAT IP
+  bindPort: 6443
+nodeRegistration:
+  name: "{{ inventory_hostname }}"
+  criSocket: unix:///run/containerd/containerd.sock
+skipPhases:
+  - addon/kube-proxy                  # Cilium will replace kube-proxy (eBPF)
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: k8s-ha-lab
+kubernetesVersion: "{{ kubeadm_version.stdout }}"
+controlPlaneEndpoint: "k8s-api:6443"  # resolves to the kube-vip VIP, so the API survives losing a master
+apiServer:
+  certSANs:
+    - k8s-api
+    - "{{ api_vip }}"
+networking:
+  podSubnet: "{{ pod_subnet }}"
+  serviceSubnet: "{{ service_subnet }}"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd

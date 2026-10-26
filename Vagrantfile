@@ -2,7 +2,7 @@
 # HA Kubernetes lab: 3 control planes + workers, on KVM/libvirt.
 # Vagrant only creates the VMs; Ansible prepares them (see ansible/).
 
-BOX     = "generic/ubuntu2404"
+BOX     = "alvistack/ubuntu-24.04"   # generic/* boxes are no longer published
 NETWORK = "192.168.56"   # private network; the API VIP will be 192.168.56.100
 
 # Comment out w2 if you are short on RAM (remove it from ansible/inventory.ini too).

@@ -1,0 +1,177 @@
+---
+# Phases 3, 4 and 6: kube-vip + kubeadm init on cp1, then join cp2/cp3 and the workers.
+# Idempotent: nodes that are already initialized or joined are skipped.
+# Run prepare-nodes.yml first.
+
+# ---------------------------------------------------------------------------
+# Play 1: first control plane (kube-vip + kubeadm init)
+# ---------------------------------------------------------------------------
+- name: Initialize the first control plane
+  hosts: cp1
+  become: true
+  tasks:
+    - name: Check whether the cluster is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Init cp1
+      when: not admin_conf.stat.exists
+      block:
+        - name: Find the interface that carries the private network IP
+          ansible.builtin.shell: >
+            ip -o -4 addr show | awk '$4 ~ "^{{ node_ip }}/" {print $2}'
+          register: vip_iface
+          changed_when: false
+          failed_when: vip_iface.stdout == ""
+
+        - name: Pull the kube-vip image
+          ansible.builtin.command: "ctr image pull {{ kube_vip_image }}"
+          changed_when: false
+
+        - name: Generate the kube-vip static pod manifest (ARP mode, control plane VIP)
+          ansible.builtin.command: >
+            ctr run --rm --net-host {{ kube_vip_image }} kube-vip-gen
+            /kube-vip manifest pod
+            --interface {{ vip_iface.stdout }}
+            --address {{ api_vip }}
+            --controlplane --arp --leaderElection
+          register: kv_manifest
+          changed_when: false
+
+        - name: Create the static pod manifests directory
+          ansible.builtin.file:
+            path: /etc/kubernetes/manifests
+            state: directory
+            mode: "0755"
+
+        # Since Kubernetes 1.29, admin.conf has no rights until kubeadm init has
+        # finished, so kube-vip must use super-admin.conf during bootstrap only.
+        - name: Write the kube-vip manifest, using super-admin.conf for the bootstrap
+          ansible.builtin.copy:
+            content: "{{ kv_manifest.stdout | replace('path: /etc/kubernetes/admin.conf', 'path: /etc/kubernetes/super-admin.conf') }}\n"
+            dest: /etc/kubernetes/manifests/kube-vip.yaml
+            mode: "0600"
+
+        - name: Read the installed kubeadm version
+          ansible.builtin.command: kubeadm version -o short
+          register: kubeadm_version
+          changed_when: false
+
+        - name: Render the kubeadm config
+          ansible.builtin.template:
+            src: kubeadm-init.yaml.j2
+            dest: /root/kubeadm-init.yaml
+            mode: "0600"
+
+        - name: Run kubeadm init (takes 1-3 minutes)
+          ansible.builtin.command: kubeadm init --config /root/kubeadm-init.yaml --upload-certs
+          register: kubeadm_init
+
+        - name: Switch kube-vip back to admin.conf (super-admin.conf exists only on cp1)
+          ansible.builtin.replace:
+            path: /etc/kubernetes/manifests/kube-vip.yaml
+            regexp: 'path: /etc/kubernetes/super-admin.conf'
+            replace: 'path: /etc/kubernetes/admin.conf'
+
+    - name: Wait for the API to answer on the VIP
+      ansible.builtin.wait_for:
+        host: "{{ api_vip }}"
+        port: 6443
+        timeout: 180
+
+    - name: Give the vagrant user a kubeconfig
+      ansible.builtin.include_tasks: tasks/user-kubeconfig.yml
+
+    - name: Download the admin kubeconfig to the project folder (git-ignored)
+      ansible.builtin.fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ playbook_dir }}/../kubeconfig"
+        flat: true
+
+    - name: Point the local kubeconfig at the VIP (your laptop doesn't resolve k8s-api)
+      become: false
+      delegate_to: localhost
+      ansible.builtin.replace:
+        path: "{{ playbook_dir }}/../kubeconfig"
+        regexp: 'https://k8s-api:6443'
+        replace: "https://{{ api_vip }}:6443"
+
+    - name: Create a fresh join command (tokens expire after 24h)
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+    - name: Upload control plane certs and get the decryption key (expires after 2h)
+      ansible.builtin.shell: kubeadm init phase upload-certs --upload-certs | tail -1
+      register: cert_key
+      changed_when: false
+
+# ---------------------------------------------------------------------------
+# Play 2: other control planes, one at a time (etcd adds one member at a time)
+# ---------------------------------------------------------------------------
+- name: Join the other control planes
+  hosts: control_plane:!cp1
+  become: true
+  serial: 1
+  tasks:
+    - name: Check whether this node has already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join as control plane
+      when: not kubelet_conf.stat.exists
+      block:
+        - name: Run kubeadm join --control-plane
+          ansible.builtin.command: >
+            {{ hostvars['cp1'].join_cmd.stdout }}
+            --control-plane
+            --certificate-key {{ hostvars['cp1'].cert_key.stdout }}
+            --apiserver-advertise-address {{ node_ip }}
+
+        - name: Find the interface that carries the private network IP
+          ansible.builtin.shell: >
+            ip -o -4 addr show | awk '$4 ~ "^{{ node_ip }}/" {print $2}'
+          register: vip_iface
+          changed_when: false
+          failed_when: vip_iface.stdout == ""
+
+        - name: Pull the kube-vip image
+          ansible.builtin.command: "ctr image pull {{ kube_vip_image }}"
+          changed_when: false
+
+        - name: Generate the kube-vip manifest
+          ansible.builtin.command: >
+            ctr run --rm --net-host {{ kube_vip_image }} kube-vip-gen
+            /kube-vip manifest pod
+            --interface {{ vip_iface.stdout }}
+            --address {{ api_vip }}
+            --controlplane --arp --leaderElection
+          register: kv_manifest
+          changed_when: false
+
+        - name: Write the kube-vip manifest (admin.conf works on joined nodes)
+          ansible.builtin.copy:
+            content: "{{ kv_manifest.stdout }}\n"
+            dest: /etc/kubernetes/manifests/kube-vip.yaml
+            mode: "0600"
+
+    - name: Give the vagrant user a kubeconfig
+      ansible.builtin.include_tasks: tasks/user-kubeconfig.yml
+
+# ---------------------------------------------------------------------------
+# Play 3: workers
+# ---------------------------------------------------------------------------
+- name: Join the workers
+  hosts: workers
+  become: true
+  tasks:
+    - name: Check whether this node has already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Run kubeadm join
+      ansible.builtin.command: "{{ hostvars['cp1'].join_cmd.stdout }}"
+      when: not kubelet_conf.stat.exists
