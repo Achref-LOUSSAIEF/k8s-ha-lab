@@ -1,0 +1,145 @@
+---
+# Prepares every node for kubeadm: hosts, swap, kernel, containerd, kube packages.
+# Idempotent: safe to run again at any time.
+- name: Prepare all nodes for kubeadm
+  hosts: k8s
+  become: true
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    - name: Restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+    - name: Restart kubelet
+      ansible.builtin.service:
+        name: kubelet
+        state: restarted
+
+  tasks:
+    # ---------- Name resolution ----------
+    - name: Add cluster nodes and API VIP to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} K8S LAB"
+        block: |
+          {{ api_vip }} k8s-api
+          {% for h in groups['k8s'] %}
+          {{ hostvars[h].node_ip }} {{ h }}
+          {% endfor %}
+
+    # ---------- Swap ----------
+    - name: Turn swap off now
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+      changed_when: true
+
+    - name: Keep swap off after reboot
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    # ---------- Kernel modules & sysctl ----------
+    - name: Load overlay and br_netfilter at boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Load overlay and br_netfilter now
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop: [overlay, br_netfilter]
+      changed_when: false
+
+    - name: Set networking sysctls for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        mode: "0644"
+      notify: Reload sysctl
+
+    # ---------- containerd ----------
+    - name: Install containerd and prerequisites
+      ansible.builtin.apt:
+        name: [containerd, apt-transport-https, ca-certificates, curl, gpg]
+        state: present
+        update_cache: true
+
+    - name: Create /etc/containerd
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd config
+      ansible.builtin.shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Use the systemd cgroup driver
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: Make sure containerd is running
+      ansible.builtin.service:
+        name: containerd
+        state: started
+        enabled: true
+
+    # ---------- kubeadm, kubelet, kubectl ----------
+    - name: Create apt keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download the Kubernetes repo signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+
+    - name: Add the Kubernetes apt repo
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Install kubelet, kubeadm and kubectl
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: true
+
+    - name: Hold kube packages at their version
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    # Each VM has two NICs (Vagrant NAT + private network). Without this,
+    # kubelet advertises the NAT IP and nodes can't reach each other.
+    - name: Make kubelet advertise the private network IP
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}\n"
+        mode: "0644"
+      notify: Restart kubelet
+
+    - name: Enable kubelet
+      ansible.builtin.service:
+        name: kubelet
+        enabled: true
