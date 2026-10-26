@@ -102,10 +102,19 @@
       register: join_cmd
       changed_when: false
 
-    - name: Upload control plane certs and get the decryption key (expires after 2h)
-      ansible.builtin.shell: kubeadm init phase upload-certs --upload-certs | tail -1
+    # We generate the key ourselves rather than parsing kubeadm's log output,
+    # which goes to stderr on recent versions.
+    - name: Generate a certificate key for joining control planes
+      ansible.builtin.command: kubeadm certs certificate-key
       register: cert_key
       changed_when: false
+      failed_when: cert_key.stdout | length != 64
+
+    - name: Upload the control plane certs, encrypted with that key (expires after 2h)
+      ansible.builtin.command: >
+        kubeadm init phase upload-certs --upload-certs
+        --certificate-key {{ cert_key.stdout }}
+      changed_when: true
 
 # ---------------------------------------------------------------------------
 # Play 2: other control planes, one at a time (etcd adds one member at a time)
