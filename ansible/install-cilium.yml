@@ -1,0 +1,53 @@
+---
+# Phase 5: Cilium as the CNI, replacing kube-proxy (eBPF).
+# Runs from cp1 with the cilium CLI. Idempotent: skips the install if Cilium is already there.
+- name: Install Cilium
+  hosts: cp1
+  become: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Check whether the cilium CLI is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/cilium
+      register: cilium_cli
+
+    - name: Install the cilium CLI (latest stable)
+      when: not cilium_cli.stat.exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        V=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        cd /tmp
+        curl -fsSL -O "https://github.com/cilium/cilium-cli/releases/download/${V}/cilium-linux-amd64.tar.gz"
+        tar xzf cilium-linux-amd64.tar.gz -C /usr/local/bin
+        rm cilium-linux-amd64.tar.gz
+      args:
+        executable: /bin/bash
+
+    - name: Check whether Cilium is already deployed
+      ansible.builtin.command: kubectl -n kube-system get daemonset cilium
+      register: cilium_ds
+      failed_when: false
+      changed_when: false
+
+    # kubeProxyReplacement: kubeadm skipped kube-proxy, Cilium handles Services in eBPF.
+    # k8sServiceHost: without kube-proxy, Cilium can't use the 10.96.0.1 Service IP
+    #   to reach the API, so we give it the VIP (survives losing a master).
+    # ipam.mode=kubernetes: use the per-node pod CIDRs kubeadm carves out of pod_subnet.
+    - name: Install Cilium (takes a few minutes)
+      when: cilium_ds.rc != 0
+      ansible.builtin.command: >
+        cilium install --version {{ cilium_version }}
+        --set kubeProxyReplacement=true
+        --set k8sServiceHost={{ api_vip }}
+        --set k8sServicePort=6443
+        --set ipam.mode=kubernetes
+        --set hubble.relay.enabled=true
+
+    - name: Wait until Cilium is healthy on every node
+      ansible.builtin.command: cilium status --wait --wait-duration 10m
+      changed_when: false
+
+    - name: Wait until all nodes are Ready
+      ansible.builtin.command: kubectl wait --for=condition=Ready nodes --all --timeout=5m
+      changed_when: false
