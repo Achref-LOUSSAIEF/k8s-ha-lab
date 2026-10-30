@@ -64,7 +64,7 @@
             var: plan.stdout_lines
           when: is_first_cp | bool
 
-        - name: Upgrade the cluster (first master: control plane, etcd, CoreDNS, cluster config)
+        - name: Upgrade the cluster from the first master (control plane, etcd, CoreDNS, cluster config)
           ansible.builtin.command: "kubeadm upgrade apply {{ target.stdout }} --yes"
           when: is_first_cp | bool
 

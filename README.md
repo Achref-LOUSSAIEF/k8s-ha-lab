@@ -22,7 +22,7 @@ etcd quorum, backup/restore and upgrades without downtime.
 |---|---|---|
 | Hypervisor | KVM/libvirt + Vagrant | Native on Linux, lighter than VirtualBox, VMs as code |
 | OS | Ubuntu 24.04 (`alvistack/ubuntu-24.04` box) | LTS, maintained libvirt box |
-| Kubernetes | v1.36 (one minor behind latest) | Leaves a real upgrade to practice |
+| Kubernetes | v1.37 (installed as v1.36, then upgraded in place) | The upgrade is part of the lab |
 | Runtime | containerd, systemd cgroup driver | kubeadm default, matches kubelet |
 | API endpoint | kube-vip static pods, ARP mode | No extra load balancer VM; the VIP follows a healthy master |
 | etcd | Stacked, 3 members | Tolerates the loss of 1 member (quorum = 2) |
@@ -111,6 +111,34 @@ all masters, because it relied on `crictl`, which isn't installed on the nodes. 
 watches processes with `pgrep`, and it is idempotent, so re-running it resumed the restore
 where it stopped. Test DR runbooks before you need them.
 
+## Rolling upgrade: 1.36 → 1.37
+
+`ansible/upgrade-cluster.yml` follows the kubeadm procedure, one node at a time
+(`serial: 1`): switch the apt repo to the new minor, upgrade kubeadm, then
+`kubeadm upgrade apply` on the first master (control plane, etcd, CoreDNS) or
+`kubeadm upgrade node` on the others, then drain, upgrade kubelet and kubectl, wait for
+`Ready`, uncordon. Nodes already on the target version are skipped, so it can be re-run.
+
+Before starting: a fresh etcd snapshot, and a PodDisruptionBudget on the test app
+(`minAvailable: 2` out of 3 replicas), so a drain evicts its pods one at a time and waits
+for each replacement to be Ready.
+
+Kubeadm keeps kube-proxy out of the upgrade: skipping it at init is recorded as
+`proxy.disabled` in the cluster configuration, and the upgrade's kube-proxy phase checks it.
+
+| Measure (polled every second during the whole upgrade) | Result |
+|---|---|
+| Application (NodePort, 3 replicas, PDB) | **always HTTP 200**, no interruption |
+| API through the VIP | one window of about **22 s** unavailable (00:29:06 → 00:29:29) |
+| End state | 5 nodes on v1.37, all Ready |
+
+The API window happened while the API server restarted on the master that held the VIP.
+In ARP mode, kube-vip does not health-check the API server: the VIP only moves once the
+leader fails to renew its lease, which takes about as long as the failover test. Pods
+keep running without the API, so applications are not affected. To remove that window,
+the options are a load balancer with real health checks (HAProxy on `/readyz`, BGP/ECMP),
+or moving the VIP away from a master before upgrading it.
+
 ## Problems met and how they were solved
 
 1. **`generic/ubuntu2404` box returns 404.** The Roboxes `generic/*` boxes are no longer
@@ -137,6 +165,12 @@ where it stopped. Test DR runbooks before you need them.
    verification and is retried until timeout. Fix: pass `--kubeconfig` with another path,
    which kubeadm uses as-is (through the VIP, which is in the certificate).
 
+5. **Delegated tasks connecting with the wrong SSH key.** The drain runs on the first
+   master on behalf of the node being upgraded (`delegate_to`). The key path was a group
+   variable built from `{{ inventory_hostname }}`, which still refers to the original host
+   during a delegated task, so Ansible connected to `cp1` with `cp2`'s key. Fix: an
+   explicit key path on each host line of the inventory.
+
 ## Roadmap
 
 - [x] Node preparation automated with Ansible
@@ -144,5 +178,5 @@ where it stopped. Test DR runbooks before you need them.
 - [x] Cilium with kube-proxy replacement
 - [x] HA test: loss of the VIP holder
 - [x] etcd: snapshot, restore, replacement of a quorum member
-- [ ] Minor version upgrade (1.36 → 1.37), node by node, without workload downtime
+- [x] Minor version upgrade (1.36 → 1.37), node by node, without workload downtime
 - [ ] NetworkPolicies: default-deny per namespace, explicit allows, observed with Hubble
